@@ -167,40 +167,35 @@ async function handleRoute(request, { params }) {
     // Get trending/featured books
     if (route === '/books/trending' && method === 'GET') {
       const categories = [
-        { name: 'Popular This Week', subject: 'popular' },
         { name: 'Science Fiction', subject: 'science_fiction' },
         { name: 'Fantasy', subject: 'fantasy' },
         { name: 'Romance', subject: 'romance' },
         { name: 'Mystery', subject: 'mystery' },
-        { name: 'Thriller', subject: 'thriller' },
-        { name: 'Business', subject: 'business' },
         { name: 'Self Help', subject: 'self-help' },
-        { name: 'Philosophy', subject: 'philosophy' },
-        { name: 'Psychology', subject: 'psychology' },
       ]
       
-      const results = await Promise.all(
-        categories.map(async (cat) => {
-          try {
-            const response = await fetch(`${OPEN_LIBRARY_BASE}/subjects/${cat.subject}.json?limit=15`)
-            const data = await response.json()
-            return {
-              category: cat.name,
-              subject: cat.subject,
-              books: (data.works || []).slice(0, 15).map(book => ({
-                key: book.key,
-                title: book.title,
-                author: book.authors?.[0]?.name || 'Unknown Author',
-                coverId: book.cover_id,
-                coverUrl: book.cover_id ? `${COVERS_BASE}/b/id/${book.cover_id}-L.jpg` : null,
-                firstPublishYear: book.first_publish_year,
-              }))
-            }
-          } catch (e) {
-            return { category: cat.name, subject: cat.subject, books: [] }
-          }
-        })
-      )
+      // Fetch sequentially to reduce memory usage
+      const results = []
+      for (const cat of categories) {
+        try {
+          const response = await fetch(`${OPEN_LIBRARY_BASE}/subjects/${cat.subject}.json?limit=12`)
+          const data = await response.json()
+          results.push({
+            category: cat.name,
+            subject: cat.subject,
+            books: (data.works || []).slice(0, 12).map(book => ({
+              key: book.key,
+              title: book.title,
+              author: book.authors?.[0]?.name || 'Unknown Author',
+              coverId: book.cover_id,
+              coverUrl: book.cover_id ? `${COVERS_BASE}/b/id/${book.cover_id}-L.jpg` : null,
+              firstPublishYear: book.first_publish_year,
+            }))
+          })
+        } catch (e) {
+          results.push({ category: cat.name, subject: cat.subject, books: [] })
+        }
+      }
       
       return handleCORS(NextResponse.json({ categories: results }))
     }
