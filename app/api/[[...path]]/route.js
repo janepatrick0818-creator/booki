@@ -2,6 +2,9 @@ import { MongoClient } from 'mongodb'
 import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
 import { getVoices, generateSpeech, chunkText, VOICE_SETTINGS } from '@/lib/elevenlabs'
+import { hashPassword, verifyPassword, generateToken, authenticateRequest } from '@/lib/auth'
+import { writeFile, mkdir } from 'fs/promises'
+import path from 'path'
 
 // MongoDB connection
 let client
@@ -34,6 +37,19 @@ export async function OPTIONS() {
 const OPEN_LIBRARY_BASE = 'https://openlibrary.org'
 const COVERS_BASE = 'https://covers.openlibrary.org'
 
+// Categories with translations
+const CATEGORIES = [
+  { name: 'Science Fiction', nameEs: 'Ciencia Ficción', namePt: 'Ficção Científica', subject: 'science_fiction' },
+  { name: 'Fantasy', nameEs: 'Fantasía', namePt: 'Fantasia', subject: 'fantasy' },
+  { name: 'Romance', nameEs: 'Romance', namePt: 'Romance', subject: 'romance' },
+  { name: 'Mystery', nameEs: 'Misterio', namePt: 'Mistério', subject: 'mystery' },
+  { name: 'Self Help', nameEs: 'Autoayuda', namePt: 'Autoajuda', subject: 'self-help' },
+  { name: 'Philosophy', nameEs: 'Filosofía', namePt: 'Filosofia', subject: 'philosophy' },
+  { name: 'Psychology', nameEs: 'Psicología', namePt: 'Psicologia', subject: 'psychology' },
+  { name: 'Biography', nameEs: 'Biografía', namePt: 'Biografia', subject: 'biography' },
+  { name: 'History', nameEs: 'Historia', namePt: 'História', subject: 'history' },
+]
+
 // Route handler function
 async function handleRoute(request, { params }) {
   const { path = [] } = params
@@ -48,6 +64,154 @@ async function handleRoute(request, { params }) {
       return handleCORS(NextResponse.json({ message: "Booki API v1.0", status: "running" }))
     }
 
+    // ==================== AUTHENTICATION ====================
+    
+    // Register
+    if (route === '/auth/register' && method === 'POST') {
+      const body = await request.json()
+      const { email, password, name } = body
+      
+      if (!email || !password || !name) {
+        return handleCORS(NextResponse.json(
+          { error: 'Email, password and name are required' },
+          { status: 400 }
+        ))
+      }
+      
+      // Check if user exists
+      const existingUser = await db.collection('users').findOne({ email: email.toLowerCase() })
+      if (existingUser) {
+        return handleCORS(NextResponse.json(
+          { error: 'User already exists' },
+          { status: 400 }
+        ))
+      }
+      
+      const hashedPassword = await hashPassword(password)
+      const user = {
+        id: uuidv4(),
+        email: email.toLowerCase(),
+        password: hashedPassword,
+        name,
+        language: 'pt',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      }
+      
+      await db.collection('users').insertOne(user)
+      const token = generateToken(user.id, user.email)
+      
+      const { password: _, ...userWithoutPassword } = user
+      
+      const response = handleCORS(NextResponse.json({
+        message: 'User registered successfully',
+        user: userWithoutPassword,
+        token
+      }))
+      
+      response.cookies.set('token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 60 * 60 * 24 * 7 // 7 days
+      })
+      
+      return response
+    }
+
+    // Login
+    if (route === '/auth/login' && method === 'POST') {
+      const body = await request.json()
+      const { email, password } = body
+      
+      if (!email || !password) {
+        return handleCORS(NextResponse.json(
+          { error: 'Email and password are required' },
+          { status: 400 }
+        ))
+      }
+      
+      const user = await db.collection('users').findOne({ email: email.toLowerCase() })
+      if (!user) {
+        return handleCORS(NextResponse.json(
+          { error: 'Invalid credentials' },
+          { status: 401 }
+        ))
+      }
+      
+      const isValid = await verifyPassword(password, user.password)
+      if (!isValid) {
+        return handleCORS(NextResponse.json(
+          { error: 'Invalid credentials' },
+          { status: 401 }
+        ))
+      }
+      
+      const token = generateToken(user.id, user.email)
+      const { password: _, ...userWithoutPassword } = user
+      
+      const response = handleCORS(NextResponse.json({
+        message: 'Login successful',
+        user: userWithoutPassword,
+        token
+      }))
+      
+      response.cookies.set('token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 60 * 60 * 24 * 7
+      })
+      
+      return response
+    }
+
+    // Get current user
+    if (route === '/auth/me' && method === 'GET') {
+      const user = await authenticateRequest(request, db)
+      if (!user) {
+        return handleCORS(NextResponse.json(
+          { error: 'Unauthorized' },
+          { status: 401 }
+        ))
+      }
+      
+      const { password: _, ...userWithoutPassword } = user
+      return handleCORS(NextResponse.json({ user: userWithoutPassword }))
+    }
+
+    // Update user settings
+    if (route === '/auth/settings' && method === 'PUT') {
+      const user = await authenticateRequest(request, db)
+      if (!user) {
+        return handleCORS(NextResponse.json(
+          { error: 'Unauthorized' },
+          { status: 401 }
+        ))
+      }
+      
+      const body = await request.json()
+      const { language, name } = body
+      
+      const updateData = { updatedAt: new Date() }
+      if (language) updateData.language = language
+      if (name) updateData.name = name
+      
+      await db.collection('users').updateOne(
+        { id: user.id },
+        { $set: updateData }
+      )
+      
+      return handleCORS(NextResponse.json({ message: 'Settings updated' }))
+    }
+
+    // Logout
+    if (route === '/auth/logout' && method === 'POST') {
+      const response = handleCORS(NextResponse.json({ message: 'Logged out successfully' }))
+      response.cookies.delete('token')
+      return response
+    }
+
     // ==================== OPEN LIBRARY PROXY ====================
     
     // Search books
@@ -56,16 +220,23 @@ async function handleRoute(request, { params }) {
       const query = searchParams.get('q') || ''
       const page = searchParams.get('page') || 1
       const limit = searchParams.get('limit') || 20
+      const lang = searchParams.get('lang') || 'pt'
       
-      const response = await fetch(
-        `${OPEN_LIBRARY_BASE}/search.json?q=${encodeURIComponent(query)}&page=${page}&limit=${limit}`
-      )
+      // Add language filter for Portuguese books if requested
+      let searchUrl = `${OPEN_LIBRARY_BASE}/search.json?q=${encodeURIComponent(query)}&page=${page}&limit=${limit}`
+      if (lang === 'pt') {
+        searchUrl += '&language=por'
+      } else if (lang === 'es') {
+        searchUrl += '&language=spa'
+      }
+      
+      const response = await fetch(searchUrl)
       const data = await response.json()
       
       const books = (data.docs || []).map(book => ({
         key: book.key,
         title: book.title,
-        author: book.author_name?.[0] || 'Unknown Author',
+        author: book.author_name?.[0] || 'Autor Desconhecido',
         authorKey: book.author_key?.[0],
         coverId: book.cover_i,
         coverUrl: book.cover_i ? `${COVERS_BASE}/b/id/${book.cover_i}-L.jpg` : null,
@@ -90,16 +261,17 @@ async function handleRoute(request, { params }) {
       const subject = path[2]
       const { searchParams } = new URL(request.url)
       const limit = searchParams.get('limit') || 20
+      const lang = searchParams.get('lang') || 'pt'
       
-      const response = await fetch(
-        `${OPEN_LIBRARY_BASE}/subjects/${subject}.json?limit=${limit}`
-      )
+      let fetchUrl = `${OPEN_LIBRARY_BASE}/subjects/${subject}.json?limit=${limit}`
+      
+      const response = await fetch(fetchUrl)
       const data = await response.json()
       
       const books = (data.works || []).map(book => ({
         key: book.key,
         title: book.title,
-        author: book.authors?.[0]?.name || 'Unknown Author',
+        author: book.authors?.[0]?.name || 'Autor Desconhecido',
         authorKey: book.authors?.[0]?.key?.replace('/authors/', ''),
         coverId: book.cover_id,
         coverUrl: book.cover_id ? `${COVERS_BASE}/b/id/${book.cover_id}-L.jpg` : null,
@@ -151,7 +323,7 @@ async function handleRoute(request, { params }) {
         subjects: work.subjects?.slice(0, 10) || [],
         authors: work.authors?.map(a => ({
           key: a.author?.key?.replace('/authors/', ''),
-          name: authorDetails?.name || 'Unknown',
+          name: authorDetails?.name || 'Desconhecido',
           bio: authorDetails?.bio?.value || authorDetails?.bio || ''
         })) || [],
         firstPublishDate: work.first_publish_date,
@@ -166,27 +338,28 @@ async function handleRoute(request, { params }) {
 
     // Get trending/featured books
     if (route === '/books/trending' && method === 'GET') {
-      const categories = [
-        { name: 'Science Fiction', subject: 'science_fiction' },
-        { name: 'Fantasy', subject: 'fantasy' },
-        { name: 'Romance', subject: 'romance' },
-        { name: 'Mystery', subject: 'mystery' },
-        { name: 'Self Help', subject: 'self-help' },
-      ]
+      const { searchParams } = new URL(request.url)
+      const lang = searchParams.get('lang') || 'pt'
       
       // Fetch sequentially to reduce memory usage
       const results = []
-      for (const cat of categories) {
+      for (const cat of CATEGORIES) {
         try {
           const response = await fetch(`${OPEN_LIBRARY_BASE}/subjects/${cat.subject}.json?limit=12`)
           const data = await response.json()
+          
+          // Get translated category name
+          let categoryName = cat.name
+          if (lang === 'pt') categoryName = cat.namePt
+          else if (lang === 'es') categoryName = cat.nameEs
+          
           results.push({
-            category: cat.name,
+            category: categoryName,
             subject: cat.subject,
             books: (data.works || []).slice(0, 12).map(book => ({
               key: book.key,
               title: book.title,
-              author: book.authors?.[0]?.name || 'Unknown Author',
+              author: book.authors?.[0]?.name || 'Autor Desconhecido',
               coverId: book.cover_id,
               coverUrl: book.cover_id ? `${COVERS_BASE}/b/id/${book.cover_id}-L.jpg` : null,
               firstPublishYear: book.first_publish_year,
@@ -287,7 +460,11 @@ async function handleRoute(request, { params }) {
     // Get user library
     if (route === '/library' && method === 'GET') {
       const { searchParams } = new URL(request.url)
-      const userId = searchParams.get('userId') || 'guest'
+      let userId = searchParams.get('userId') || 'guest'
+      
+      // Try to get authenticated user
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
       
       const library = await db.collection('user_library')
         .find({ userId })
@@ -301,7 +478,11 @@ async function handleRoute(request, { params }) {
     // Add book to library
     if (route === '/library' && method === 'POST') {
       const body = await request.json()
-      const { userId = 'guest', book, status = 'want_to_read' } = body
+      let { userId = 'guest', book, status = 'want_to_read' } = body
+      
+      // Try to get authenticated user
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
       
       if (!book || !book.key) {
         return handleCORS(NextResponse.json(
@@ -315,7 +496,7 @@ async function handleRoute(request, { params }) {
         userId,
         bookKey: book.key,
         book,
-        status, // 'reading', 'finished', 'want_to_read'
+        status,
         progress: 0,
         createdAt: new Date(),
         updatedAt: new Date()
@@ -364,12 +545,76 @@ async function handleRoute(request, { params }) {
       return handleCORS(NextResponse.json({ message: 'Book removed from library' }))
     }
 
+    // ==================== UPLOADED BOOKS ====================
+    
+    // Get uploaded books
+    if (route === '/uploads' && method === 'GET') {
+      const { searchParams } = new URL(request.url)
+      let userId = searchParams.get('userId') || 'guest'
+      
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
+      
+      const uploads = await db.collection('uploaded_books')
+        .find({ userId })
+        .sort({ createdAt: -1 })
+        .toArray()
+      
+      const cleaned = uploads.map(({ _id, ...rest }) => rest)
+      return handleCORS(NextResponse.json({ books: cleaned }))
+    }
+
+    // Upload book (metadata only - file stored on client side using IndexedDB)
+    if (route === '/uploads' && method === 'POST') {
+      const body = await request.json()
+      let { userId = 'guest', title, author, format, fileSize, chapters } = body
+      
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
+      
+      if (!title || !format) {
+        return handleCORS(NextResponse.json(
+          { error: 'Title and format are required' },
+          { status: 400 }
+        ))
+      }
+      
+      const uploadedBook = {
+        id: uuidv4(),
+        userId,
+        title,
+        author: author || 'Desconhecido',
+        format,
+        fileSize,
+        chapters: chapters || [],
+        status: 'ready',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      }
+      
+      await db.collection('uploaded_books').insertOne(uploadedBook)
+      return handleCORS(NextResponse.json({ 
+        message: 'Book uploaded successfully', 
+        book: uploadedBook 
+      }))
+    }
+
+    // Delete uploaded book
+    if (route.startsWith('/uploads/') && method === 'DELETE') {
+      const bookId = path[1]
+      await db.collection('uploaded_books').deleteOne({ id: bookId })
+      return handleCORS(NextResponse.json({ message: 'Book deleted' }))
+    }
+
     // ==================== AUDIOBOOKS ====================
     
     // Get user's audiobooks
     if (route === '/audiobooks' && method === 'GET') {
       const { searchParams } = new URL(request.url)
-      const userId = searchParams.get('userId') || 'guest'
+      let userId = searchParams.get('userId') || 'guest'
+      
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
       
       const audiobooks = await db.collection('audiobooks')
         .find({ userId })
@@ -383,7 +628,10 @@ async function handleRoute(request, { params }) {
     // Create audiobook from text
     if (route === '/audiobooks' && method === 'POST') {
       const body = await request.json()
-      const { userId = 'guest', bookKey, title, chapters, voiceId } = body
+      let { userId = 'guest', bookKey, title, chapters, voiceId } = body
+      
+      const user = await authenticateRequest(request, db)
+      if (user) userId = user.id
       
       if (!title || !chapters || !chapters.length || !voiceId) {
         return handleCORS(NextResponse.json(
@@ -401,9 +649,9 @@ async function handleRoute(request, { params }) {
         chapters: chapters.map((ch, idx) => ({
           id: uuidv4(),
           index: idx,
-          title: ch.title || `Chapter ${idx + 1}`,
+          title: ch.title || `Capítulo ${idx + 1}`,
           text: ch.text,
-          status: 'pending', // 'pending', 'processing', 'completed', 'error'
+          status: 'pending',
           audioUrl: null,
           duration: null
         })),
